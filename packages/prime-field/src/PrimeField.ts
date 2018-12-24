@@ -7,12 +7,14 @@ interface IField {
   id: string;
   name: string;
   title: string;
+  description: string;
   type: string;
   group: string;
   position: number;
   contentTypeId: string;
   contentTypeFieldId: string;
   options: any; // tslint:disable-line no-any
+  apiName: string;
 }
 
 interface IContentType {
@@ -48,6 +50,9 @@ export interface IPrimeFieldGraphQLArguments {
   field: IField;
   queries: {
     [key: string]: any; // tslint:disable-line no-any
+  };
+  models: {
+    ContentEntry: any; // tslint:disable-line no-any
   };
   contentType: IContentType;
   contentTypes: IContentType[];
@@ -116,7 +121,7 @@ export abstract class PrimeField {
    * Process input data
    * @param input Object for input
    */
-  public processInput(input) {
+  public processInput(input, field: IField) {
     return input;
   }
 
@@ -124,7 +129,7 @@ export abstract class PrimeField {
    * Process output data
    * @param output Object for output
    */
-  public processOutput(output) {
+  public processOutput(output, field: IField) {
     return output;
   }
 
