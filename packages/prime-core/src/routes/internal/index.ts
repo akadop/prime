@@ -1,4 +1,4 @@
-import { ApolloServer, AuthenticationError, UserInputError } from 'apollo-server-express';
+import { ApolloServer, AuthenticationError, UserInputError, ForbiddenError } from 'apollo-server-express';
 import * as express from 'express';
 import { GraphQLBoolean, GraphQLID, GraphQLInputObjectType, GraphQLInt, GraphQLList,
   GraphQLNonNull, GraphQLObjectType, GraphQLSchema, GraphQLString, GraphQLEnumType } from 'graphql';
@@ -21,6 +21,9 @@ import { sequelize } from '../../sequelize';
 import { GraphQLSettingsInput } from '../../types/settings';
 import { algolia } from '../../utils/algolia';
 import { acl } from '../../acl';
+import { ContentRelease } from '../../models/ContentRelease';
+import { Webhook } from '../../models/Webhook';
+import { WebhookCall } from '../../models/WebhookCall';
 
 const entryTransformer = new EntryTransformer();
 
@@ -36,6 +39,31 @@ export const internalGraphql = async (restart) => {
       ['contentTypeId']
     )
   });
+
+  const webhookType = new GraphQLObjectType({
+    name: 'Webhook',
+    fields: () => ({
+      ...attributeFields(Webhook),
+      success: { type: GraphQLInt },
+      count: { type: GraphQLInt },
+    })
+  });
+
+  const webhookCallType = new GraphQLObjectType({
+    name: 'WebhookCall',
+    fields: () => omit(attributeFields(WebhookCall), ['webhookId']),
+  });
+
+  const webhookInputType =  new GraphQLNonNull(
+    new GraphQLInputObjectType({
+      name: 'WebhookInput',
+      fields: {
+        name: { type: new GraphQLNonNull(GraphQLString) },
+        url: { type: new GraphQLNonNull(GraphQLString) },
+        method: { type: new GraphQLNonNull(GraphQLString) },
+      }
+    })
+  );
 
   const userType = new GraphQLObjectType({
     name: 'User',
@@ -67,6 +95,14 @@ export const internalGraphql = async (restart) => {
       },
       entriesCount: { type: GraphQLInt },
     })
+  });
+
+  const contentReleaseType = new GraphQLObjectType({
+    name: 'ContentRelease',
+    fields: () => ({
+      ...attributeFields(ContentRelease),
+      documents: { type: GraphQLInt },
+    }),
   });
 
   const contentEntryType = new GraphQLObjectType({
@@ -138,6 +174,7 @@ export const internalGraphql = async (restart) => {
     type: contentEntryConnectionType,
     args: {
       contentTypeId: { type: GraphQLID },
+      contentReleaseId: { type: GraphQLID },
       language: { type: GraphQLString },
       userId: { type: GraphQLString },
       limit: { type: GraphQLInt },
@@ -169,7 +206,7 @@ export const internalGraphql = async (restart) => {
       before: (findOptions, args, context) => {
         const language = args.language || 'en';
         const published = null;
-        const contentReleaseId = null;
+        const contentReleaseId = args.contentReleaseId || null;
 
         findOptions.attributes = {
           include: [
@@ -205,13 +242,17 @@ export const internalGraphql = async (restart) => {
         if (args.contentTypeId) {
           values.where.contentTypeId = args.contentTypeId;
         }
+        const where = {
+          ...values.where,
+          language: args.language,
+        };
+        if (args.contentReleaseId) {
+          where.contentReleaseId = args.contentReleaseId;
+        }
         const totalCount = await ContentEntry.count({
           distinct: true,
           col: 'entryId',
-          where: {
-            ...values.where,
-            language: args.language,
-          },
+          where,
         });
         values.totalCount = totalCount;
 
@@ -330,6 +371,27 @@ export const internalGraphql = async (restart) => {
       })
     },
     allFields,
+    allContentReleases: {
+      type: new GraphQLList(contentReleaseType),
+      resolve: resolver(ContentRelease, {
+        async before(options) {
+          options.attributes = {
+            include: [
+              [
+                sequelize.literal(`(SELECT COUNT(DISTINCT "entryId") FROM "ContentEntry" "c" WHERE "c"."contentReleaseId" = "ContentRelease"."id")`),
+                'documents'
+              ],
+            ]
+          };
+          return options;
+        },
+        after(values) {
+          return values.map(({ dataValues }) => ({
+            ...dataValues,
+          }));
+        }
+      }),
+    },
     allContentEntries,
     allUsers: {
       type: new GraphQLList(userType),
@@ -339,6 +401,49 @@ export const internalGraphql = async (restart) => {
             user.roles = await acl.userRoles(user.id);
             return user;
           }));
+        }
+      }),
+    },
+    allWebhooks: {
+      type: new GraphQLList(webhookType),
+      resolve: resolver(Webhook, {
+        async before(options) {
+          options.attributes = {
+            include: [
+              [
+                sequelize.literal(`(SELECT COUNT(*) FROM "WebhookCall" "c" WHERE "c"."webhookId" = "Webhook"."id" AND success = TRUE)`),
+                'success'
+              ],
+              [
+                sequelize.literal(`(SELECT COUNT(*) FROM "WebhookCall" "c" WHERE "c"."webhookId" = "Webhook"."id")`),
+                'count'
+              ],
+            ]
+          };
+          return options;
+        },
+        after(values) {
+          return values.map(({ dataValues }) => ({
+            ...dataValues,
+          }));
+        }
+      }),
+    },
+    allWebhookCalls: {
+      type: new GraphQLList(webhookCallType),
+      args: {
+        id: { type: new GraphQLNonNull(GraphQLID) }
+      },
+      resolve: resolver(WebhookCall, {
+        before(opts, args) {
+          opts.attributes = {
+            exclude: ['request', 'response'],
+          };
+          opts.where = {
+            webhookId: args.id,
+          }
+          opts.order = [['executedAt', 'DESC']];
+          return opts;
         }
       }),
     },
@@ -360,6 +465,36 @@ export const internalGraphql = async (restart) => {
 
         return count === 0;
       }
+    },
+    Webhook: {
+      type: webhookType,
+      args: {
+        id: { type: new GraphQLNonNull(GraphQLID) }
+      },
+      resolve: resolver(Webhook, {
+        before(opts, args, context) {
+          opts.where = {
+            id: args.id
+          };
+
+          return opts;
+        }
+      }),
+    },
+    WebhookCall: {
+      type: webhookCallType,
+      args: {
+        id: { type: new GraphQLNonNull(GraphQLID) }
+      },
+      resolve: resolver(WebhookCall, {
+        before(opts, args, context) {
+          opts.where = {
+            id: args.id
+          };
+
+          return opts;
+        }
+      }),
     },
     ContentType: {
       type: contentTypeType,
@@ -443,7 +578,14 @@ export const internalGraphql = async (restart) => {
           return result;
         }
       })
-    }
+    },
+    ContentRelease: {
+      type: contentReleaseType,
+      args: {
+        id: { type: new GraphQLNonNull(GraphQLID) },
+      },
+      resolve: resolver(ContentRelease)
+    },
   };
 
   const mutationFields = {
@@ -453,6 +595,7 @@ export const internalGraphql = async (restart) => {
         input: { type: GraphQLSettingsInput },
       },
       async resolve(root, args, context, info) {
+        await context.ensureAllowed('settings', 'update');
         const done = await Settings.create({
           data: args.input,
           userId: context.user.id,
@@ -468,7 +611,12 @@ export const internalGraphql = async (restart) => {
         schema: { type: new GraphQLNonNull(new GraphQLList(ContentTypeFieldGroupInputType)) },
       },
       async resolve(root, args, context, info) {
-        await setFields(args.contentTypeId, args.schema);
+        await context.ensureAllowed('schema', 'update');
+        try {
+          await setFields(args.contentTypeId, args.schema);
+        } catch (err) {
+          // failed to set fields
+        }
         restart();
 
         return true;
@@ -526,6 +674,8 @@ export const internalGraphql = async (restart) => {
         },
       },
       async resolve(root, args, context, info) {
+        await context.ensureAllowed('user', 'create');
+
         const user = await User.create({
           firstname: args.input.firstname,
           lastname: args.input.lastname,
@@ -539,12 +689,58 @@ export const internalGraphql = async (restart) => {
         return user;
       },
     },
+    updateUser: {
+      type: userType,
+      args: {
+        id: { type: new GraphQLNonNull(GraphQLID) },
+        input: {
+          type: new GraphQLInputObjectType({
+            name: 'UpdateUserInput',
+            fields: {
+              firstname: { type: GraphQLString },
+              lastname: { type: GraphQLString },
+              email: { type: new GraphQLNonNull(GraphQLString) },
+              password: { type: new GraphQLNonNull(GraphQLString) },
+              roles: { type: new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(GraphQLString))) },
+            }
+          })
+        },
+      },
+      async resolve(root, args, context, info) {
+        await context.ensureAllowed('user', 'edit');
+
+        const user = await User.findOne({
+          where: {
+            id: args.id,
+          }
+        });
+
+        if (user) {
+
+          await user.update({
+            firstname: args.input.firstname,
+            lastname: args.input.lastname,
+            email: args.input.email,
+            password: args.input.password,
+          });
+
+          const roles = await acl.userRoles(user.id);
+          await acl.removeUserRoles(user.id, roles);
+          await acl.addUserRoles(user.id, args.input.roles);
+
+          (user as any).roles = args.input.roles;
+        }
+        return user;
+      },
+    },
     removeUser: {
       type: GraphQLBoolean,
       args: {
         id: { type: new GraphQLNonNull(GraphQLID) }
       },
       async resolve(root, args, context, info) {
+        await context.ensureAllowed('user', 'delete');
+
         if (context.user.id === args.id) {
           throw new UserInputError('You can not remove yourself');
         }
@@ -624,6 +820,8 @@ export const internalGraphql = async (restart) => {
         }
       },
       async resolve(root, args, context, info) {
+        await context.ensureAllowed('schema', 'create');
+
         const entry = await ContentType.create({
           name: args.input.name,
           title: args.input.title,
@@ -653,6 +851,7 @@ export const internalGraphql = async (restart) => {
         }
       },
       async resolve(root, args, context, info) {
+        await context.ensureAllowed('schema', 'update');
         const contentType = await ContentType.findOne({
           where: { id: args.id },
         });
@@ -677,7 +876,8 @@ export const internalGraphql = async (restart) => {
         id: { type: GraphQLID }
       },
       async resolve(root, args, context, info) {
-        const contentType = await ContentType.findById(args.id);
+        await context.ensureAllowed('schema', 'delete');
+        const contentType = await ContentType.findOne({ where: { id: args.id } });
         if (contentType) {
           await contentType.destroy();
           restart();
@@ -688,49 +888,110 @@ export const internalGraphql = async (restart) => {
         return false;
       }
     },
-    updateContentEntry: {
-      type: contentEntryType,
+    createContentRelease: {
+      type: contentReleaseType,
       args: {
-        entryId: { type: new GraphQLNonNull(GraphQLID) },
-        language: { type: GraphQLString },
-        data: { type: GraphQLJSON }
+        name: { type: GraphQLString },
+        description: { type: GraphQLString },
+        scheduledAt: { type: GraphQLString },
       },
       async resolve(root, args, context, info) {
-        const entry = await ContentEntry.findOne({
-          where: {
-            entryId: args.entryId
-          },
-          order: [
-            ['createdAt', 'DESC']
-          ]
+        await context.ensureAllowed('release', 'create');
+        const contentRelease = await ContentRelease.create({
+          name: args.name,
+          description: args.description,
+          scheduledAt: args.scheduledAt,
         });
 
-        if (entry) {
-
-          entryTransformer.resetTransformCache();
-
-          if (args.data) {
-            args.data = await entryTransformer.transformInput(args.data, entry.contentTypeId);
-          }
-
-          const updatedEntry = await entry.draft(args.data, args.language || 'en', context.user.id);
-
-          updatedEntry.data = await entryTransformer.transformOutput(updatedEntry.data, entry.contentTypeId);
-
-          return updatedEntry;
+        return contentRelease;
+      }
+    },
+    updateContentRelease: {
+      type: contentReleaseType,
+      args: {
+        id: { type: new GraphQLNonNull(GraphQLID) },
+        name: { type: GraphQLString },
+        description: { type: GraphQLString },
+        scheduledAt: { type: GraphQLString },
+      },
+      async resolve(root, args, context, info) {
+        await context.ensureAllowed('release', 'update');
+        const contentRelease = await ContentRelease.findOne({ where: { id: args.id } });
+        if (contentRelease) {
+          await contentRelease.update({
+            name: args.name,
+            description: args.description,
+            scheduledAt: args.scheduledAt,
+          });
         }
 
-        return null;
+        return contentRelease;
       }
+    },
+    publishContentRelease: {
+      type: GraphQLBoolean,
+      args: {
+        id: { type: new GraphQLNonNull(GraphQLID) },
+      },
+      async resolve(root, args, context, info) {
+        await context.ensureAllowed('document', 'publish');
+        const entries = await ContentEntry.findAll({
+          having: {
+            versionId: sequelize.literal(`"ContentEntry"."versionId" = (
+              SELECT "ce"."versionId"
+              FROM "ContentEntry" AS "ce"
+              WHERE "ce"."contentReleaseId" = ${sequelize.escape(args.id)}
+              ORDER BY "ce"."updatedAt" DESC
+              LIMIT 1
+            )`),
+          } as any,
+          where: {
+            contentReleaseId: args.id,
+          },
+          group: ['versionId'],
+        });
+        await Promise.all(entries.map(entry => entry.publish(context.user.id)));
+        await ContentEntry.update({ contentReleaseId: null }, { where: { contentReleaseId: args.id } })
+        const contentRelease = await ContentRelease.findOne({ where: { id: args.id }});
+        if (contentRelease) {
+          contentRelease.update({
+            publishedAt: new Date(),
+            publishedBy: context.user.id,
+          });
+        }
+        return true;
+      },
+    },
+    removeContentRelease: {
+      type: GraphQLBoolean,
+      args: {
+        id: { type: new GraphQLNonNull(GraphQLID) },
+      },
+      async resolve(root, args, context, info) {
+        await context.ensureAllowed('release', 'delete');
+
+        await ContentRelease.destroy({
+          where: { id: args.id },
+        });
+        await ContentEntry.destroy({
+          where: {
+            contentReleaseId: args.id,
+          }
+        });
+        return true;
+      },
     },
     createContentEntry: {
       type: contentEntryType,
       args: {
         contentTypeId: { type: new GraphQLNonNull(GraphQLID) },
+        contentReleaseId: { type: GraphQLID },
         language: { type: GraphQLString },
         data: { type: GraphQLJSON }
       },
       async resolve(root, args, context, info) {
+
+        await context.ensureAllowed('document', 'create');
 
         entryTransformer.resetTransformCache();
 
@@ -741,6 +1002,7 @@ export const internalGraphql = async (restart) => {
         const entry = await ContentEntry.create({
           isPublished: false,
           contentTypeId: args.contentTypeId,
+          contentReleaseId: args.contentReleaseId,
           language: args.language || 'en',
           data: args.data,
           userId: context.user.id
@@ -751,12 +1013,92 @@ export const internalGraphql = async (restart) => {
         return entry;
       }
     },
+    updateContentEntry: {
+      type: contentEntryType,
+      args: {
+        versionId: { type: new GraphQLNonNull(GraphQLID) },
+        contentReleaseId: { type: GraphQLID },
+        language: { type: GraphQLString },
+        data: { type: GraphQLJSON }
+      },
+      async resolve(root, args, context, info) {
+        await context.ensureAllowed('document', 'update');
+
+        const entry = await ContentEntry.findOne({
+          where: {
+            versionId: args.versionId
+          },
+        });
+
+        if (entry) {
+
+          entryTransformer.resetTransformCache();
+
+          if (args.data) {
+            args.data = await entryTransformer.transformInput(args.data, entry.contentTypeId);
+          }
+
+          const updatedEntry = await entry.draft(args.data, args.language || 'en', args.contentReleaseId, context.user.id);
+
+          updatedEntry.data = await entryTransformer.transformOutput(updatedEntry.data, entry.contentTypeId);
+
+          return updatedEntry;
+        }
+
+        return null;
+      }
+    },
+    publishContentEntry: {
+      type: contentEntryType,
+      args: {
+        versionId: { type: new GraphQLNonNull(GraphQLID) }
+      },
+      async resolve(root, args, context, info) {
+        await context.ensureAllowed('document', 'publish');
+        const entry = await ContentEntry.findOne({
+          where: {
+            versionId: args.versionId
+          }
+        });
+
+        entryTransformer.resetTransformCache();
+
+        if (entry) {
+          await ContentEntry.update({ contentReleaseId: null }, {
+            where: {
+              entryId: entry.entryId,
+              contentReleaseId: entry.contentReleaseId,
+            },
+          });
+
+          const publishedEntry = await entry.publish(context.user.id);
+          publishedEntry.data = await entryTransformer.transformOutput(publishedEntry.data, publishedEntry.contentTypeId);
+
+          if (algolia.index) {
+            algolia.index.saveObject({
+              objectID: `${entry.entryId}-${entry.language}`,
+              _entryId: entry.entryId,
+              _language: entry.language,
+              ...publishedEntry.data,
+            });
+          }
+
+          Webhook.run('document.published', { document: publishedEntry });
+
+          return publishedEntry;
+        }
+
+        return false;
+      }
+    },
     unpublishContentEntry: {
       type: contentEntryType,
       args: {
         versionId: { type: new GraphQLNonNull(GraphQLID) }
       },
       async resolve(root, args, context, info) {
+        await context.ensureAllowed('document', 'unpublish');
+
         const entry = await ContentEntry.findOne({
           where: {
             versionId: args.versionId
@@ -774,7 +1116,7 @@ export const internalGraphql = async (restart) => {
               language: entry.language,
             }
           });
-          return {
+          const res = {
             ...entry.dataValues,
             isPublished: false,
             data: await entryTransformer.transformOutput(entry.data, entry.contentTypeId),
@@ -794,40 +1136,11 @@ export const internalGraphql = async (restart) => {
               ]
             }),
           };
+
+          Webhook.run('document.unpublished', { document: res });
+
+          return res;
         }
-      }
-    },
-    publishContentEntry: {
-      type: contentEntryType,
-      args: {
-        versionId: { type: new GraphQLNonNull(GraphQLID) }
-      },
-      async resolve(root, args, context, info) {
-        const entry = await ContentEntry.findOne({
-          where: {
-            versionId: args.versionId
-          }
-        });
-
-        entryTransformer.resetTransformCache();
-
-        if (entry) {
-          const publishedEntry = await entry.publish(context.user.id);
-          publishedEntry.data = await entryTransformer.transformOutput(publishedEntry.data, publishedEntry.contentTypeId);
-
-          if (algolia.index) {
-            algolia.index.saveObject({
-              objectID: `${entry.entryId}-${entry.language}`,
-              _entryId: entry.entryId,
-              _language: entry.language,
-              ...publishedEntry.data,
-            });
-          }
-
-          return publishedEntry;
-        }
-
-        return false;
       }
     },
     removeContentEntry: {
@@ -837,6 +1150,8 @@ export const internalGraphql = async (restart) => {
         language: { type: GraphQLString },
       },
       async resolve(root, args, context, info) {
+        await context.ensureAllowed('document', 'delete');
+
         const where: any = {
           entryId: args.id,
         };
@@ -849,6 +1164,59 @@ export const internalGraphql = async (restart) => {
           await algolia.index.deleteBy({ filters: `_entryId:${args.id}` });
         }
         const success = await ContentEntry.destroy({ where });
+
+        Webhook.run('document.deleted', { document: { id: args.id } });
+
+        return Boolean(success);
+      },
+    },
+    createWebhook: {
+      type: queryFields.Webhook.type,
+      args: {
+        input: {
+          type: webhookInputType,
+        }
+      },
+      async resolve(root, args, context, info) {
+        await context.ensureAllowed('settings', 'update');
+        const webhook = await Webhook.create({
+          name: args.input.name,
+          url: args.input.url,
+          method: args.input.method,
+          userId: context.user.id,
+        });
+        return webhook;
+      }
+    },
+    updateWebhook: {
+      type: queryFields.Webhook.type,
+      args: {
+        id: { type: new GraphQLNonNull(GraphQLID) },
+        input: {
+          type: webhookInputType,
+        }
+      },
+      async resolve(root, args, context, info) {
+        await context.ensureAllowed('settings', 'update');
+        const webhook = await Webhook.findOne({ where: { id: args.id }});
+        if (webhook) {
+          await webhook.update({
+            name: args.input.name,
+            url: args.input.url,
+            method: args.input.method,
+          });
+        }
+        return webhook;
+      }
+    },
+    removeWebhook: {
+      type: GraphQLBoolean,
+      args: {
+        id: { type: new GraphQLNonNull(GraphQLID) },
+      },
+      async resolve(root, args, context, info) {
+        await context.ensureAllowed('settings', 'update');
+        const success = await Webhook.destroy({ where: { id: args.id } });
         return Boolean(success);
       },
     }
@@ -875,6 +1243,13 @@ export const internalGraphql = async (restart) => {
         throw new AuthenticationError('Not authenticated');
       }
 
+      const ensureAllowed = async (resources, permissions) => {
+        const isAllowed = await acl.isAllowed(user.id, resources, permissions);
+        if (!isAllowed) {
+          throw new ForbiddenError('Insufficient permissions');
+        }
+      };
+
       if (Sentry) {
         Sentry.configureScope(scope => {
           if (user) {
@@ -883,7 +1258,7 @@ export const internalGraphql = async (restart) => {
         });
       }
 
-      return { user };
+      return { user, ensureAllowed };
     },
     formatError(error) {
       if (Sentry) {

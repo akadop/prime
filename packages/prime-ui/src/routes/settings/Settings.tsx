@@ -1,14 +1,17 @@
 import React from 'react';
 import { Layout, Card, Menu } from 'antd';
 import { Route, Switch, NavLink } from 'react-router-dom';
+import { Redirect } from 'react-router';
 import { Toolbar } from '../../components/toolbar/Toolbar';
 import { Account } from './Account';
 import { Users } from './Users';
 import { Security } from './Security';
 import { Previews } from './Previews';
 import { Locales } from './Locales';
+import { Releases } from './Releases';
+import { Webhooks } from './Webhooks';
+import { WebhookCalls } from './WebhookCalls';
 import './Settings.less';
-import { Redirect } from 'react-router';
 
 const nav = [{
   key: 'account',
@@ -22,6 +25,14 @@ const nav = [{
   key: 'security',
   title: 'Security',
   component: Security,
+}, {
+  key: 'webhooks',
+  title: 'Webhooks',
+  component: Webhooks,
+}, {
+  key: 'releases',
+  title: 'Releases',
+  component: Releases,
 }, {
   key: 'previews',
   title: 'Previews',
@@ -61,6 +72,7 @@ export const Settings = (props: any) => {
           </div>
           <div className="prime__settings__right">
             <Switch>
+              <Route exact path={`${path}/webhooks/:webhookId`} component={WebhookCalls} />
               {nav.map(({ key, component }) => (
                 <Route path={`${path}/${key}`} component={component} key={key} />
               ))}

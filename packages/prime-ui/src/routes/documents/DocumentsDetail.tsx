@@ -2,14 +2,16 @@ import React from 'react';
 import { Layout, Button, Icon, message, Skeleton, Card, Alert, Dropdown, Menu, Popover, Popconfirm } from 'antd';
 import { Link } from 'react-router-dom';
 import { observable } from 'mobx';
-import { Instance, clone } from 'mobx-state-tree';
+import { Instance } from 'mobx-state-tree';
 import { observer } from 'mobx-react';
 import { distanceInWordsToNow } from 'date-fns';
+import { isObject } from 'lodash';
 import { Toolbar } from '../../components/toolbar/Toolbar';
 import { ContentEntries } from '../../stores/contentEntries';
 import { ContentTypes } from '../../stores/contentTypes';
 import { ContentEntry } from '../../stores/models/ContentEntry';
 import { DocumentForm, BaseDocumentForm } from './components/document-form/DocumentForm';
+import { ContentReleases } from '../../stores/contentReleases';
 import { ContentType } from '../../stores/models/ContentType';
 import { Settings } from '../../stores/settings';
 import './DocumentDetail.less';
@@ -34,9 +36,11 @@ export class DocumentsDetail extends React.Component<IProps> {
   @observable loading = false;
   @observable loaded = false;
   @observable error: Error | null = null;
+  @observable loadingReleases = false;
+  @observable loadedReleases = false;
 
   componentDidMount() {
-    const search = new URLSearchParams(window.location.search)
+    const search = new URLSearchParams(window.location.search);
     this.locale = Settings.locales.find(({ id }) => id === search.get('locale')) || Settings.masterLocale;
     this.load();
 
@@ -121,24 +125,27 @@ export class DocumentsDetail extends React.Component<IProps> {
     return true;
   }
 
-  onSave = async (e: React.MouseEvent<HTMLElement>) => {
-    e.preventDefault();
+  onSave = (e: React.MouseEvent<HTMLElement>) => new Promise((resolve, reject) => {
+    if (e.preventDefault) {
+      e.preventDefault();
+    }
     if (this.documentForm) {
       const { form } = this.documentForm.props;
 
       form.validateFieldsAndScroll(async (err, values) => {
         if (err) {
           message.error('Document has validation errors');
+          reject(err);
         } else {
           const parse = (vals: any): any => {
             if (Array.isArray(vals)) {
               return vals.map(parse);
             }
-            if (typeof vals === 'object') {
+            if (isObject(vals)) {
               return Object.entries(vals || {}).reduce(
                 (acc: any, [key, value]) => {
-                  if (typeof value === 'object') {
-                    const entries = Object.entries(value);
+                  if (isObject(value)) {
+                    const entries = Object.entries(value || {});
                     const indexes = entries.filter(([k]) => Number.isInteger(Number(k)));
                     const isArrayLike = (indexes.length > 0);
                     if (isArrayLike) {
@@ -172,12 +179,14 @@ export class DocumentsDetail extends React.Component<IProps> {
             message.info('Document was saved');
           } else if (this.contentType) {
             try {
-              const contentEntry = await ContentEntries.create(this.contentType.id, parsed, this.locale.id);
+              const search = new URLSearchParams(window.location.search);
+              const contentEntry = await ContentEntries.create(this.contentType.id, parsed, this.locale.id, search.get('release'));
               if (contentEntry) {
-                this.loadEntry(contentEntry.entryId);
-                this.props.history.replace(`/documents/doc/${contentEntry.entryId}?locale=${this.locale.id}`);
+                await this.loadEntry(contentEntry.entryId);
+                this.props.history.replace(`/documents/doc/${contentEntry.entryId}?${search}`);
               }
               message.success('Document created');
+              resolve();
             } catch(err) {
               message.error('Could not create document');
               console.error(err);
@@ -186,12 +195,32 @@ export class DocumentsDetail extends React.Component<IProps> {
         }
       });
     }
+  });
+
+  onPublish = async (e: any) => {
+    if (this.contentEntry) {
+      await this.contentEntry.publish();
+      message.success('Document was published');
+    }
   }
 
-  onPublish = async (e: React.MouseEvent<HTMLElement>) => {
-    e.preventDefault();
-    await this.contentEntry!.publish();
-    message.success('Document was published');
+  onReleaseClick = async (e: any) => {
+    if (this.contentEntry) {
+      try {
+        await this.contentEntry.release(e.key);
+        message.success('Document was added to release');
+        const search = new URLSearchParams(this.props.location.search);
+        search.append('release', e.key);
+        this.props.history.replace(`/documents/doc/${this.contentEntry.entryId}?${search}`);
+      } catch (err) {
+        message.error('Something went wrong');
+      }
+    }
+  }
+
+  onDuplicate = (e: any) => {
+    this.contentEntry = null;
+    return this.onSave(e);
   }
 
   onFormRef = (ref: BaseDocumentForm) => {
@@ -300,11 +329,36 @@ export class DocumentsDetail extends React.Component<IProps> {
     const contentEntry = this.contentEntry!;
     const contentType = this.contentType!;
 
+    const { params } = this.props.match;
+    const search = new URLSearchParams(this.props.location.search);
+    const contentReleaseId = search.get('release');
+
+    const backUrl = (() => {
+      const qs = `?locale=${this.locale.id}`;
+
+      if (contentReleaseId) {
+        return `/documents/release/${contentReleaseId}${qs}`;
+      } else if (params.contentTypeId) {
+        return `/documents/schema/${params.contentTypeId}${qs}`;
+      } else if (search.get('schema') && this.contentType) {
+        return `/documents/schema/${this.contentType.id}${qs}`;
+      }
+      return `/documents/${qs}`;
+    })();
+
+    const contentReleasesMenu = (
+      <Menu onClick={this.onReleaseClick}>
+        {ContentReleases.list.map((contentRelease) => (
+          <Menu.Item key={contentRelease.id}>{contentRelease.name}</Menu.Item>
+        ))}
+      </Menu>
+    );
+
     return (
       <Layout>
         <Toolbar>
           <div style={{ flex: 1, display: 'flex' }}>
-            <Link to={`/documents?locale=${this.locale.id}`} className="ant-btn-back">
+            <Link to={backUrl} className="ant-btn-back">
               <Icon type="left" />
             </Link>
             {contentType && <h3 style={{ margin: 0 }}>{contentType.title}</h3>}
@@ -356,8 +410,30 @@ export class DocumentsDetail extends React.Component<IProps> {
               )}
             </div>
             <div style={{ padding: 16 }}>
+              {contentEntry && !contentReleaseId && !contentEntry.isPublished && (
+                <Dropdown
+                  overlay={contentReleasesMenu}
+                  trigger={['click']}
+                  placement="topCenter"
+                >
+                  <Button
+                    type="dashed"
+                    style={{ marginBottom: 8 }}
+                    block
+                    loading={this.loadingReleases}
+                    onClick={async () => {
+                      this.loadingReleases = true;
+                      await ContentReleases.loadAll();
+                      setTimeout(() => {
+                        this.loadingReleases = false;
+                      }, 330);
+                    }}
+                  >
+                    Add to release
+                  </Button>
+                </Dropdown>
+              )}
               {contentEntry && contentEntry.isPublished && (
-
                 <Popconfirm
                   title="Are you sure?"
                   icon={<Icon type="question-circle-o" style={{ color: 'red' }} />}
@@ -367,6 +443,9 @@ export class DocumentsDetail extends React.Component<IProps> {
                 >
                   <Button type="dashed" style={{ marginBottom: 8 }} block>Unpublish</Button>
                 </Popconfirm>
+              )}
+              {contentEntry && (
+                <Button onClick={this.onDuplicate} style={{ marginBottom: 8 }} block>Duplicate</Button>
               )}
               {contentEntry && (
                 <Popconfirm

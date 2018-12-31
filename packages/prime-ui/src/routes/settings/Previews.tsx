@@ -111,7 +111,7 @@ export const Previews = Form.create()(({ form }) => {
             {form.getFieldDecorator('name', {
               rules: [{ required: true }]
             })(
-              <Input size="large" placeholder="eg. Staging" />
+              <Input autoFocus={!isEditing} size="large" placeholder="eg. Staging" />
             )}
           </Form.Item>
           <Form.Item label="Preview URL">
@@ -120,7 +120,7 @@ export const Previews = Form.create()(({ form }) => {
                 required: true
               }, {
                 type: 'url',
-                message: 'Must a valid URL',
+                message: 'Must be a valid URL',
               }]
             })(
               <Input size="large" placeholder="https://yoursite.com" />
