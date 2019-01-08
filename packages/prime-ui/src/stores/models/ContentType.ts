@@ -1,4 +1,4 @@
-import { types, flow } from 'mobx-state-tree';
+import { types, flow, applySnapshot } from 'mobx-state-tree';
 import { get, cloneDeepWith, isObject } from 'lodash';
 import { LOAD_SCHEMA } from '../queries';
 import { SAVE_SCHEMA, REMOVE_CONTENT_TYPE, UPDATE_CONTENT_TYPE } from '../mutations';
@@ -6,6 +6,7 @@ import { client } from '../../utils/client';
 import { ContentTypes } from '../contentTypes';
 import { Schema } from './Schema';
 import { JSONObject } from '../../interfaces/JSONObject';
+import { Settings } from '../settings';
 
 const omitSchema = (collection: any, id: string) => {
   return cloneDeepWith(collection, (value: any) => {
@@ -31,10 +32,15 @@ export const ContentType = types
     entriesCount: types.maybeNull(types.number),
     schema: types.optional(Schema, { groups: [{ title: 'Main', fields: [] } ]}),
   })
-  .preProcessSnapshot(snapshot => ({
-    ...snapshot,
-    groups: Array.isArray(snapshot.groups) ? snapshot.groups : ['Main']
-  }))
+  .preProcessSnapshot(snapshot => {
+    const groupName = snapshot.isTemplate ? snapshot.title : 'Main';
+    const schema: any = snapshot.schema && Array.isArray(snapshot.schema) ? { groups: snapshot.schema } : snapshot.schema;
+    return {
+      ...snapshot,
+      schema,
+      groups: Array.isArray(snapshot.groups) ? snapshot.groups : [groupName],
+    };
+  })
 .actions(self => {
 
   const loadSchema = flow(function* loadSchema(){
@@ -59,8 +65,21 @@ export const ContentType = types
           .filter((group: any) => ([].concat(self.groups as any) as any).indexOf(group.title) >= 0)
       },
     });
+
+    Settings.reloadPlayground();
+
+    if (self.isSlice || self.isTemplate) {
+      ContentTypes.loadAll();
+    }
+
     return get(result, 'data.setContentTypeSchema');
   });
+
+  const replace = (data: any) => {
+    if (data) {
+      applySnapshot(self, data);
+    }
+  };
 
   const update = flow(function*(input: any) {
     delete input.isSlice;
@@ -74,11 +93,10 @@ export const ContentType = types
       }
     });
     if (data.updateContentType) {
-      const { name, title, settings } = data.updateContentType;
-      self.name = name;
-      self.title = title;
-      self.settings = settings;
+      replace(data.updateContentType);
     }
+
+    Settings.reloadPlayground();
   });
 
   const remove = flow(function*() {
@@ -92,6 +110,8 @@ export const ContentType = types
     if (data.removeContentType) {
       ContentTypes.removeById(self.id);
     }
+
+    Settings.reloadPlayground();
   });
 
   const addGroup = (title: any) => {
@@ -110,6 +130,7 @@ export const ContentType = types
   }
 
   return {
+    replace,
     remove,
     update,
     addGroup,

@@ -1,18 +1,25 @@
-import React, { useState } from 'react';
+import * as React from 'react';
 import { Query } from 'react-apollo';
 import gql from 'graphql-tag';
-import { Avatar, Table, Card, Layout, Button, Menu, Dropdown, Icon, Tooltip, Badge, Modal, message } from 'antd';
+import { Avatar, Table, Card, Layout, Button, Menu, Dropdown, Icon, Tooltip, Badge, Modal, message, Tag } from 'antd';
 import { get } from 'lodash';
 import { distanceInWordsToNow } from 'date-fns';
 import { client } from '../../utils/client';
-import { Link } from 'react-router-dom';
 import { Toolbar } from '../../components/toolbar/Toolbar';
 import { Settings } from '../../stores/settings';
-import { clone } from 'mobx-state-tree';
 import { stringToColor } from '../../utils/stringToColor';
 import { ContentReleases } from '../../stores/contentReleases';
+import { ContentTypes } from '../../stores/contentTypes';
 
-const { Content } = Layout;
+
+interface IOptions {
+  type?: string;
+  locale?: string;
+  release?: string;
+
+  [key: string]: string | undefined;
+}
+
 
 const GET_CONTENT_ENTRIES = gql`
   query contentEntries(
@@ -31,6 +38,7 @@ const GET_CONTENT_ENTRIES = gql`
     }
     allContentTypes(order: "title") {
       id
+      name
       title
       isSlice
       isTemplate
@@ -62,6 +70,7 @@ const GET_CONTENT_ENTRIES = gql`
           display
           contentType {
             id
+            name
             title
           }
           user {
@@ -79,14 +88,26 @@ const GET_CONTENT_ENTRIES = gql`
 const PER_PAGE = 10;
 
 export const DocumentsList = ({ match, history }: any) => {
+  const options: IOptions = String(match.params.options)
+    .split(';')
+    .reduce((acc: { [key: string]: string }, item: string) => {
+      const [key, value] = item.split(':');
+      acc[key] = value;
+      return acc;
+    }, {});
 
-  const search = new URLSearchParams(history.location.search);
-  const locale = Settings.locales.find(({ id }) => id === search.get('locale')) || Settings.masterLocale;
+  const opts = (proposed = {}) => {
+    return Object.entries({ ...options, ...proposed })
+      .filter(([key, value]) => value && value !== '')
+      .map(kv => kv.join(':')).join(';');
+  };
+
+  const locale = Settings.locales.find(l => l.id === options.locale) || Settings.masterLocale;
 
   React.useEffect(() => { ContentReleases.loadAll() }, [match.location]);
 
   const onLocaleClick = (e: any) => {
-    history.push(`${match.url}?locale=${e.key}`);
+    history.push(`/documents/by/${opts({ locale: e.key })}`);
   }
 
   const locales = (
@@ -101,8 +122,15 @@ export const DocumentsList = ({ match, history }: any) => {
   );
 
   let userId: any;
-  let contentTypeId = match.params.contentTypeId;
-  let contentReleaseId = match.params.contentReleaseId;
+  let contentTypeId: any = null;
+  let contentReleaseId = options.release || '';
+
+  if (options.type) {
+    const contentType = ContentTypes.list.find(c => c.name.toLocaleLowerCase() === String(options.type).toLocaleLowerCase());
+    if (contentType) {
+      contentTypeId = contentType.id;
+    }
+  }
 
   return (
     <Query
@@ -169,6 +197,12 @@ export const DocumentsList = ({ match, history }: any) => {
               backgroundColor = '#4A90E2';
             }
 
+            if (options.locale && record.language !== options.locale) {
+              dot = false;
+              icon = 'global';
+              backgroundColor = '#D3D7D6';
+            }
+
             return (
               <Badge count={dot ? '!' : 0} style={{ backgroundColor: '#faad14' }}>
                 <div style={{ width: 32, height: 32, borderRadius: 4, backgroundColor, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: 21, color: 'white' }}>
@@ -181,6 +215,12 @@ export const DocumentsList = ({ match, history }: any) => {
           title: 'Title',
           dataIndex: 'data.title',
           render(_text: string, record: any) {
+            if (options.locale && record.language !== options.locale) {
+              return <div style={{ display: 'flex' }}>
+                <i style={{ display: 'inline-flex', flex: 1 }}>{record.display}</i>
+                <Tag color="orange">Needs translation</Tag>
+              </div>
+            }
             return record.display;
           }
         }, {
@@ -231,22 +271,14 @@ export const DocumentsList = ({ match, history }: any) => {
           }
         }];
 
-        const search = new URLSearchParams(location.search);
-        if (contentReleaseId) {
-          search.set('release', contentReleaseId);
-        } else if (contentTypeId) {
-          search.set('schema', '1');
-        }
-        search.set('locale', locale.id);
-
         const onMenuClick = (e: any) => {
-          history.push(`/documents/create/${e.key}?${search}`);
+          history.push(`/documents/create/${opts({ type: e.key.toLocaleLowerCase() })}`);
         };
 
         const menu = (
           <Menu onClick={onMenuClick}>
-            {get(data, 'allContentTypes', []).filter((n: any) => !n.isSlice && !n.isTemplate).map(({ id, title }: any) => (
-              <Menu.Item key={id}>{title}</Menu.Item>
+            {get(data, 'allContentTypes', []).filter((n: any) => !n.isSlice && !n.isTemplate).map(({ name, title }: any) => (
+              <Menu.Item key={name}>{title}</Menu.Item>
             ))}
           </Menu>
         );
@@ -293,7 +325,7 @@ export const DocumentsList = ({ match, history }: any) => {
                 </Button>
               </Dropdown>
             </Toolbar>
-            <Content style={{ padding: 32, height: 'calc(100vh - 64px)' }}>
+            <Layout.Content style={{ padding: 32, height: 'calc(100vh - 64px)' }}>
               <Card
                 bodyStyle={{ padding: 0 }}
                 bordered={false}
@@ -308,13 +340,13 @@ export const DocumentsList = ({ match, history }: any) => {
                   onChange={onTableChange}
                   onRow={(record) => ({
                     onClick: () => {
-                      history.push(`/documents/doc/${record.entryId}?${search}`);
+                      history.push(`/documents/doc/${record.entryId}/${opts({ type: record.contentType.name.toLocaleLowerCase() })}`);
                     },
                   })}
                 />
               </Card>
               <div style={{ height: 180 }} />
-            </Content>
+            </Layout.Content>
           </Layout>
         );
       }}

@@ -1,11 +1,8 @@
 import React from 'react';
 import { Prompt } from 'react-router';
 import { get } from 'lodash';
-import { Form, Tabs, Button } from 'antd';
+import { Form, Tabs } from 'antd';
 import { FormComponentProps } from 'antd/lib/form';
-import { hasParentOfType } from 'mobx-state-tree';
-
-import { SchemaField } from '../../../../stores/models/Schema';
 import { client } from '../../../../utils/client';
 import { fields } from '../../../../utils/fields';
 import stores from '../../../../stores';
@@ -43,6 +40,10 @@ function renderInputField({ field, path, initialValue, form, entry, client, stor
 
 export class BaseDocumentForm extends React.Component<IDocumentFormProps, any> {
 
+  state = {
+    activeTab: get(this.props, 'schema.groups.0.title', 'Main'),
+  };
+
   renderField = (field: any, index: number) => {
     const { form } = this.props;
     return renderInputField({
@@ -79,6 +80,10 @@ export class BaseDocumentForm extends React.Component<IDocumentFormProps, any> {
           <Tabs
             type="card"
             animated={false}
+            activeKey={this.state.activeTab}
+            onChange={(activeTab: string) => {
+              this.setState({ activeTab });
+            }}
           >
             {groups.map(this.renderGroup)}
           </Tabs>
@@ -89,22 +94,4 @@ export class BaseDocumentForm extends React.Component<IDocumentFormProps, any> {
   }
 }
 
-export const DocumentForm = Form.create({
-  mapPropsToFields(props: any) {
-    return props.schema.fields.reduce((acc: any, field: any) => {
-      const paths = [field.name];
-      if (field) {
-        if (hasParentOfType(field, SchemaField)) {
-          // Don't process child fields
-          return acc;
-        }
-
-        const key = paths.join('.');
-        const value = get(props, `entry.data.${key}`, '');
-
-        acc[key] = Form.createFormField({ value });
-      }
-      return acc;
-    }, {});
-  },
-})(BaseDocumentForm);
+export const DocumentForm = Form.create()(BaseDocumentForm);

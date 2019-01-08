@@ -77,21 +77,11 @@ export const internalGraphql = async (restart) => {
     name: 'ContentType',
     fields: () => ({
       ...attributeFields(ContentType),
-      fields: {
-        type: new GraphQLList(contentTypeFieldType),
-        args: {
-          limit: { type: GraphQLInt },
-          order: { type: GraphQLString }
-        },
-        resolve: resolver(ContentTypeField, {
-          before(opts, args, context, info) {
-            opts.where = {
-              contentTypeId: info.source.id
-            };
-
-            return opts;
-          }
-        })
+      schema: {
+        type: new GraphQLList(ContentTypeFieldGroup),
+        async resolve(root, args, context, info) {
+          return getFields(root.id);
+        }
       },
       entriesCount: { type: GraphQLInt },
     })
@@ -203,22 +193,24 @@ export const internalGraphql = async (restart) => {
     },
     resolve: relay.createConnectionResolver({
       target: ContentEntry,
-      before: (findOptions, args, context) => {
+      before: async (findOptions, args, context) => {
         const language = args.language || 'en';
         const published = null;
         const contentReleaseId = args.contentReleaseId || null;
+        const settings = await Settings.get();
+        const masterLocale = settings.masterLocale.id;
 
         findOptions.attributes = {
           include: [
             [
-              sequelize.literal(`(SELECT "versionId" "vId" from "ContentEntry" "b" WHERE "b"."entryId" = "ContentEntry"."entryId" AND "b"."isPublished" = true AND "b"."language" = ${sequelize.escape(language)} ORDER BY "updatedAt" DESC LIMIT 1)`),
+              sequelize.literal(`(SELECT "versionId" "vId" from "ContentEntry" "b" WHERE "b"."entryId" = "ContentEntry"."entryId" AND "b"."isPublished" = true AND "b"."language" = ${sequelize.escape(language)} AND "b"."deletedAt" IS NULL ORDER BY "updatedAt" DESC LIMIT 1)`),
               'publishedVersionId'
-            ],
+            ]
           ]
         };
 
         findOptions.having = {
-          versionId: latestVersion({ language, published, contentReleaseId }),
+          versionId: latestVersion({ language, published, contentReleaseId, masterLocale }),
         };
 
         if (args.contentTypeId) {
@@ -232,19 +224,25 @@ export const internalGraphql = async (restart) => {
         const order = args.order || 'DESC';
         const sort = args.sort || 'updatedAt';
 
-        findOptions.order = [[sort, order]];
+        findOptions.order = [
+          sequelize.literal(`CASE WHEN "language" = ${sequelize.escape(args.language)} THEN 1 ELSE 2 END`),
+          [sort, order]
+        ];
         findOptions.offset = args.skip;
         findOptions.group = ['versionId'];
 
         return findOptions;
       },
       async after(values, args, context, info) {
+        const settings = await Settings.get();
+        const masterLocale = settings.masterLocale.id;
+
         if (args.contentTypeId) {
           values.where.contentTypeId = args.contentTypeId;
         }
         const where = {
           ...values.where,
-          language: args.language,
+          language: [args.language, masterLocale],
         };
         if (args.contentReleaseId) {
           where.contentReleaseId = args.contentReleaseId;
@@ -378,7 +376,7 @@ export const internalGraphql = async (restart) => {
           options.attributes = {
             include: [
               [
-                sequelize.literal(`(SELECT COUNT(DISTINCT "entryId") FROM "ContentEntry" "c" WHERE "c"."contentReleaseId" = "ContentRelease"."id")`),
+                sequelize.literal(`(SELECT COUNT(DISTINCT "entryId") FROM "ContentEntry" "c" WHERE "c"."contentReleaseId" = "ContentRelease"."id" AND "c"."deletedAt" IS NULL)`),
                 'documents'
               ],
             ]
@@ -457,9 +455,18 @@ export const internalGraphql = async (restart) => {
       async resolve(root, args, context, info) {
         const count = await ContentType.count({
           where: {
-            name: args.name,
-            isSlice: Boolean(args.isSlice),
-            isTemplate: Boolean(args.isTemplate),
+            [sequelize.Op.and]: [
+              {
+                isSlice: Boolean(args.isSlice),
+                isTemplate: Boolean(args.isTemplate),
+              },
+              sequelize.where(
+                sequelize.fn('lower', sequelize.col('name')),
+                {
+                  [sequelize.Op.like]: sequelize.fn('lower', args.name)
+                }
+              )
+            ]
           },
         });
 
@@ -523,6 +530,7 @@ export const internalGraphql = async (restart) => {
       args: {
         entryId: { type: GraphQLID },
         versionId: { type: GraphQLID },
+        contentReleaseId: { type: GraphQLID },
         language: { type: GraphQLString },
       },
       resolve: resolver(ContentEntry, {
@@ -535,6 +543,10 @@ export const internalGraphql = async (restart) => {
             opts.where.language = args.language;
           }
 
+          if (args.contentReleaseId) {
+            opts.where.contentReleaseId = args.contentReleaseId;
+          }
+
           opts.order = [
             ['createdAt', 'DESC']
           ];
@@ -542,19 +554,7 @@ export const internalGraphql = async (restart) => {
           return opts;
         },
         async after(result, args, context) {
-
-          if (!result && args.language) {
-            result = await ContentEntry.findOne({
-              where: {
-                entryId: args.entryId,
-              }
-            });
-            result.versionId = null;
-            result.isPublished = false;
-            result.language = args.language;
-            result.data = {};
-            result.versions = [];
-          } else {
+          if (result) {
             result.versions = await ContentEntry.findAll({
               attributes: [
                 'versionId',
@@ -634,7 +634,7 @@ export const internalGraphql = async (restart) => {
         const entries = await ContentEntry.findAll({
           attributes: [
             'entryId',
-            [sequelize.literal('(SELECT "versionId" FROM "ContentEntry" "ce" WHERE "ce"."entryId" = "ContentEntry"."entryId" AND "isPublished" = TRUE ORDER BY "updatedAt" LIMIT 1)'), 'versionId']
+            [sequelize.literal('(SELECT "versionId" FROM "ContentEntry" "ce" WHERE "ce"."entryId" = "ContentEntry"."entryId" AND "isPublished" = TRUE AND "deletedAt" IS NULL ORDER BY "updatedAt" LIMIT 1)'), 'versionId']
           ],
           where: { isPublished: true },
           group: ['entryId', 'language']
@@ -935,21 +935,19 @@ export const internalGraphql = async (restart) => {
       },
       async resolve(root, args, context, info) {
         await context.ensureAllowed('document', 'publish');
-        const entries = await ContentEntry.findAll({
-          having: {
-            versionId: sequelize.literal(`"ContentEntry"."versionId" = (
-              SELECT "ce"."versionId"
-              FROM "ContentEntry" AS "ce"
-              WHERE "ce"."contentReleaseId" = ${sequelize.escape(args.id)}
-              ORDER BY "ce"."updatedAt" DESC
-              LIMIT 1
-            )`),
-          } as any,
+        const ids = await ContentEntry.findAll({
+          attributes: [
+            'entryId',
+            [sequelize.literal(`(SELECT "versionId" FROM "ContentEntry" "c" WHERE "ContentEntry"."entryId" = "c"."entryId" AND "c"."language" = "ContentEntry"."language" AND "ContentEntry"."deletedAt" IS NULL ORDER BY "updatedAt" DESC LIMIT 1)`), 'versionId'],
+          ],
           where: {
             contentReleaseId: args.id,
           },
-          group: ['versionId'],
+          group: ['entryId', 'language']
         });
+
+        const versionId = ids.map(d => d.versionId);
+        const entries = await ContentEntry.findAll({ where: { versionId } });
         await Promise.all(entries.map(entry => entry.publish(context.user.id)));
         await ContentEntry.update({ contentReleaseId: null }, { where: { contentReleaseId: args.id } })
         const contentRelease = await ContentRelease.findOne({ where: { id: args.id }});
@@ -984,6 +982,7 @@ export const internalGraphql = async (restart) => {
     createContentEntry: {
       type: contentEntryType,
       args: {
+        entryId: { type: GraphQLID },
         contentTypeId: { type: new GraphQLNonNull(GraphQLID) },
         contentReleaseId: { type: GraphQLID },
         language: { type: GraphQLString },
@@ -1000,6 +999,7 @@ export const internalGraphql = async (restart) => {
         }
 
         const entry = await ContentEntry.create({
+          entryId: args.entryId || undefined,
           isPublished: false,
           contentTypeId: args.contentTypeId,
           contentReleaseId: args.contentReleaseId,
@@ -1147,6 +1147,7 @@ export const internalGraphql = async (restart) => {
       type: GraphQLBoolean,
       args: {
         id: { type: new GraphQLNonNull(GraphQLID) },
+        contentReleaseId: { type: GraphQLID },
         language: { type: GraphQLString },
       },
       async resolve(root, args, context, info) {
@@ -1155,14 +1156,20 @@ export const internalGraphql = async (restart) => {
         const where: any = {
           entryId: args.id,
         };
+
+        if (args.contentReleaseId) {
+          where.contentReleaseId = args.contentReleaseId;
+        }
+
         if (args.language) {
           where.language = args.language;
           if (algolia.index) {
-            await algolia.index.deleteObject(args.id);
+            await algolia.index.deleteObject(`${args.id}-${args.language}`,);
           }
         } else if (algolia.index) {
           await algolia.index.deleteBy({ filters: `_entryId:${args.id}` });
         }
+
         const success = await ContentEntry.destroy({ where });
 
         Webhook.run('document.deleted', { document: { id: args.id } });
